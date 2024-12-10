@@ -1,0 +1,1163 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FS.h> // Añadido para SPIFFS
+#include <HttpClient.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+#include <RTClib.h>  // Biblioteca RTC para DS3231
+#include <vector>
+
+std::vector<int> diasCancha1Array = {0, 1, 2, 3, 4, 5, 6};  // Inicializar con los dÃas permitidos
+std::vector<int> diasCancha2Array = {0, 1, 2, 3, 4, 5, 6};
+
+
+
+int numDiasCancha1;
+int numDiasCancha2;
+
+// Definición del servidor web
+ESP8266WebServer server(80);
+
+// Cliente MQTT
+WiFiClientSecure espClientSecure;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Variables de configuración WiFi
+String ssid;
+String password;
+
+// Configuración del servidor Flask
+const char* serverAddress = "sjrc.com.ar";  // Cambia esto a la dirección IP de tu servidor
+const int port = 443;
+
+// Configuración del dispositivo  
+String jwt_token = "";      // ID del usuario
+String nombre = "";  
+
+#define releLuz1 D6
+#define releLuz2 D7
+
+
+bool wifiConnected = true; // Asumiendo que el WiFi está conectado
+// Variables globales para almacenar los últimos valores de horas
+String lastHoraInicioCancha1 = "";
+String lastHoraApagadoCancha1 = "";
+String lastHoraInicioCancha2 = "";
+String lastHoraApagadoCancha2 = "";
+String conexionTopic;
+String Luz1Topic;
+String Luz2Topic;
+String ManualTopic;
+String horaencendidoTopic1;
+String horaapagadoTopic1;
+String horaencendidoTopic2;
+String horaapagadoTopic2;
+String fechaCancha1Topic1;
+String fechaCancha2Topic2;
+int diaActual=-1;
+// RTC DS3231
+RTC_DS3231 rtc;
+
+// Ruta del archivo de configuración
+const char* configFilePath = "/config.json";
+
+// Bandera Registro unico
+bool isRegistered = false; 
+
+int failedReconnectAttempts = 0;
+const int maxReconnectAttempts = 3;
+bool offlineMode = false;  // Modo offline solo si no hay WiFi
+bool controlmanual = false;
+unsigned long lastReconnectAttempt = 0;  // Último intento de reconexión a MQTT
+const unsigned long reconnectInterval = 5000;  // Intentar reconectar cada 5 segundos (5000 ms)
+const int mqttKeepAlive = 15;  // Configurar keep-alive en 15 segundos
+
+// Milis para verificar el tiempo
+unsigned long previousMillis = 0;
+
+
+
+// Variables globales para los horarios de cada cancha en formato String
+String horaInicioCancha1 = "00:00";  // Formato "HH:MM" para cancha 1
+String horaApagadoCancha1 = "00:00"; // Formato "HH:MM" para cancha 1
+String horaInicioCancha2 = "00:00";  // Formato "HH:MM" para cancha 2
+String horaApagadoCancha2 = "00:00"; // Formato "HH:MM" para cancha 2
+
+
+// Variable que faltaba declarar
+bool luz1on = false;
+bool luz2on = false;
+
+
+void imprimirArreglo(const std::vector<int>& diasArray) {
+    Serial.print("Contenido del arreglo: ");
+    for (int dia : diasArray) {
+        Serial.print(dia);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
+
+bool getTimeFromAPI() {
+  HttpClient http(espClient, "worldtimeapi.org", 80);
+  String timeApiPath = "/api/timezone/America/Argentina/San_Juan";
+  
+  // Hacer la solicitud GET a la API
+  int httpCode = http.get(timeApiPath);
+
+  if (httpCode == 0) {
+    int statusCode = http.responseStatusCode();
+    if (statusCode > 0) {
+      String response = http.responseBody();
+      StaticJsonDocument<4096> doc;
+      DeserializationError error = deserializeJson(doc, response);
+
+      if (!error) {
+        const char* datetime = doc["datetime"];
+        int dayOfWeek = doc["day_of_week"];
+        String dateTimeStr = String(datetime);
+
+        // Ajustar el día de la semana para que lunes sea 0 y domingo sea 6.
+        diaActual = (dayOfWeek + 6) % 7;
+
+        // Parsear la fecha y la hora directamente desde el valor proporcionado por la API
+        int year = dateTimeStr.substring(0, 4).toInt();
+        int month = dateTimeStr.substring(5, 7).toInt();
+        int day = dateTimeStr.substring(8, 10).toInt();
+        int hour = dateTimeStr.substring(11, 13).toInt();
+        int minute = dateTimeStr.substring(14, 16).toInt();
+        int second = dateTimeStr.substring(17, 19).toInt();
+
+        // Ajustar el RTC con la fecha y hora obtenidas directamente de la API
+        rtc.adjust(DateTime(year, month, day, hour, minute, second));
+        
+        // Imprimir la fecha, hora y el día de la semana convertido para verificar
+        Serial.printf("Fecha: %04d-%02d-%02d\n", year, month, day);
+        Serial.printf("Hora actual: %02d:%02d:%02d\n", hour, minute, second);
+        Serial.printf("Día de la semana ajustado : %d\n", diaActual);
+        Serial.println("RTC ajustado con éxito.");
+        return true;
+      } else {
+        // Fallo en el parsing JSON
+        Serial.println("Error al parsear JSON. Manteniendo la hora actual del RTC.");
+      }
+    } else {
+      // Fallo en la respuesta HTTP
+      Serial.println("Error en la respuesta HTTP. Manteniendo la hora actual del RTC.");
+    }
+  } else {
+    // Fallo en la solicitud HTTP
+    Serial.println("Error al hacer la solicitud HTTP. Manteniendo la hora actual del RTC.");
+  }
+
+  // Mantener el valor actual del RTC si la API no responde
+  DateTime now = rtc.now();
+  diaActual = (now.dayOfTheWeek() + 6) % 7; // Ajusta el día de la semana de RTC a tu formato
+  Serial.printf("Día del RTC sin la API (lunes=0): %d\n", diaActual);
+  return false;  // Mantener la hora actual del RTC
+}
+
+
+
+// Configurar el dispositivo como punto de acceso
+void startAPMode() {
+  Serial.println("Iniciando modo AP...");
+  WiFi.softAP("Jockey");
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("Dirección IP del AP: ");
+  Serial.println(ip);
+
+  startWebServer();  // Inicia el servidor web
+}
+
+
+
+// Función para obtener la hora actual correctamente
+void obtenerHoraActual() {
+  DateTime now = rtc.now();  // Leer la hora actual
+  // Crear un buffer para almacenar la hora en formato "HH:MM"
+  char horaCompleta[6];  // "HH:MM" + null terminator
+  sprintf(horaCompleta, "%02d:%02d", now.hour(), now.minute());
+
+  // Imprimir la hora actual
+  Serial.println(diaActual);
+  Serial.print("Hora actual: ");
+  Serial.println(horaCompleta);
+  
+
+}
+// Función modificada verificarHorario
+void verificarHorario() {
+  DateTime now = rtc.now();
+  
+  // Convertir la hora y minutos actuales a formato "HH:MM"
+  String horaActual = String(now.hour());
+  String minutoActual = String(now.minute());
+
+  // Asegurarse de que el formato sea "HH:MM" (añadiendo ceros si es necesario)
+  if (horaActual.length() == 1) horaActual = "0" + horaActual;
+  if (minutoActual.length() == 1) minutoActual = "0" + minutoActual;
+
+  String horaCompleta = horaActual + ":" + minutoActual;
+
+  // Verificar si hoy es un día permitido para cancha 1
+  if (esDiaPermitidoCancha1()) {
+    if (horaCompleta == horaInicioCancha1) {
+      digitalWrite(releLuz1, LOW);  // Encender luz cancha 1
+      Serial.println("Luz 1 encendida (horaInicioCancha1 alcanzada).");
+      luz1on = true;
+      sendLuzCancha1(luz1on, Luz1Topic);
+    } else if (horaCompleta == horaApagadoCancha1) {
+      digitalWrite(releLuz1, HIGH);  // Apagar luz cancha 1
+      Serial.println("Luz 1 apagada (horaApagadoCancha1 alcanzada).");
+      luz1on = false;
+      sendLuzCancha1(luz1on, Luz1Topic);
+    }
+  } else {
+    Serial.println("Hoy no es un día permitido para cancha 1.");
+  }
+
+  // Verificar si hoy es un día permitido para cancha 2
+  if (esDiaPermitidoCancha2()) {
+    if (horaCompleta == horaInicioCancha2) {
+      digitalWrite(releLuz2, LOW);  // Encender luz cancha 2
+      Serial.println("Luz 2 encendida (horaInicioCancha2 alcanzada).");
+      luz2on = true;
+      sendLuzCancha2(luz2on, Luz2Topic);
+    } else if (horaCompleta == horaApagadoCancha2) {
+      digitalWrite(releLuz2, HIGH);  // Apagar luz cancha 2
+      Serial.println("Luz 2 apagada (horaApagadoCancha2 alcanzada).");
+      luz2on = false;
+      sendLuzCancha2(luz2on, Luz2Topic);
+    }
+  } else {
+    Serial.println("Hoy no es un día permitido para cancha 2.");
+  }
+}
+void procesarDiasCancha(String dias, std::vector<int>& diasArray) {
+    diasArray.clear();  // Limpiar el contenido previo
+
+    // Eliminar los corchetes del string
+    dias.replace("[", "");
+    dias.replace("]", "");
+    dias.trim();  // Eliminar espacios adicionales
+
+    Serial.print("Procesando días desde el string (sin corchetes): ");
+    Serial.println(dias);  // Ver el valor exacto del string recibido
+
+    int startIndex = 0;
+    for (int i = 0; i <= dias.length(); i++) {
+        if (i == dias.length() || dias.charAt(i) == ',') {
+            String diaStr = dias.substring(startIndex, i);
+            
+            // Solo agregar si el substring no está vacío
+            diaStr.trim(); // Eliminar espacios en blanco
+            if (diaStr.length() > 0) {
+                int dia = diaStr.toInt();
+                diasArray.push_back(dia);  // Añadir el valor al vector
+
+                // Depuración: imprimir el valor extraído
+                Serial.print("Día extraído: ");
+                Serial.println(dia);
+            }
+            startIndex = i + 1;
+        }
+    }
+
+    // Imprimir los días procesados
+    Serial.print("Días procesados: ");
+    for (int dia : diasArray) {
+        Serial.print(dia);
+        Serial.print(" ");
+    }
+    Serial.println();
+}
+
+void serializarDiasArray(const std::vector<int>& diasArray) {
+    StaticJsonDocument<5000> doc;
+
+    // Crear un array dentro del documento JSON
+    JsonArray diasJsonArray = doc.createNestedArray("diasArray");
+
+    // Recorrer el std::vector y agregar cada valor al JsonArray
+    for (int dia : diasArray) {
+        diasJsonArray.add(dia);
+    }
+
+    // Serializar el documento JSON a la salida serial o a otro destino
+    serializeJson(doc, Serial);  // Imprimir el JSON a la consola serial
+}
+
+
+// Función para verificar si hoy es un día permitido para cancha 1
+bool esDiaPermitidoCancha1() {
+  Serial.print("Cancha 1 dias: ");
+  imprimirArreglo(diasCancha1Array);
+  
+  // Comparar el día actual con los días permitidos de cancha 1
+  for (int i = 0; i < numDiasCancha1; i++) {
+    if (diasCancha1Array[i] == diaActual) {
+      Serial.print("dia encontrado ");
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+
+// Función para verificar si hoy es un día permitido para cancha 2
+bool esDiaPermitidoCancha2() {
+  Serial.print("Cancha 2 dias: ");
+  imprimirArreglo(diasCancha2Array);
+  // Comparar el día actual con los días permitidos de cancha 2
+  for (int i = 0; i < numDiasCancha2; i++) {
+    if (diasCancha2Array[i] == diaActual) {
+      Serial.print("dia encontrado ");
+      return true;
+    }
+  }
+
+  return false;
+}
+
+
+void registerDevice() {
+  if (isRegistered) {
+    Serial.println("Dispositivo ya registrado, omitiendo el registro.");
+    return;  // Si ya está registrado, no hacer nada
+  }
+
+  HttpClient https(espClientSecure, serverAddress, port);
+  String ipAddress = WiFi.localIP().toString();
+  String registerUrl = String("/nuevo_dispositivo");
+
+  String payload = "{\"ip\":\"" + ipAddress + "\",\"nombre\":\"" + nombre + "\","
+                   "\"Topicos\":{\"estado\":[\"conexion\"],"
+                   "\"accion\":[\"Luz_Cancha1-on-off\",\"Luz_Cancha2-on-off\",\"Manual-on-off\",\"Hora_Encendido_para_Cancha1\",\"Hora_Apagado_para_Cancha1\",\"Hora_Encendido_para_Cancha2\",\"Hora_Apagado_para_Cancha2\",\"fecha_Cancha1\",\"fecha_Cancha2\"]}}";
+
+  // Enviar solicitud POST con JWT en las cabeceras
+  https.beginRequest();
+  https.post(registerUrl);
+  https.sendHeader("Authorization", "Bearer " + jwt_token);  // Enviar JWT en cabecera
+  https.sendHeader("Content-Type", "application/json");
+  https.sendHeader("Content-Length", payload.length());
+  https.write((const byte*)payload.c_str(), payload.length());
+  https.endRequest();
+  
+  int httpResponseCode = https.responseStatusCode();
+  String response = https.responseBody();
+
+  Serial.print("Código de respuesta HTTP: ");
+  Serial.println(httpResponseCode);
+  Serial.print("Respuesta del servidor: ");
+  Serial.println(response);
+
+  if (httpResponseCode == 201) {
+    Serial.println("Dispositivo registrado correctamente.");
+    Serial.println("Respuesta: " + response);
+    isRegistered = true;  // Marcar como registrado
+
+    StaticJsonDocument<4096> doc;
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (error) {
+      Serial.println("Error al parsear la respuesta JSON.");
+      return;
+    }
+
+    if (doc.containsKey("Topicos")) {
+      JsonArray topicos = doc["Topicos"];
+
+      if (topicos.size() >= 9) {
+        conexionTopic = topicos[0].as<String>();
+        Luz1Topic = topicos[1].as<String>();
+        Luz2Topic = topicos[2].as<String>();
+        ManualTopic = topicos[3].as<String>();
+        horaencendidoTopic1= topicos[4].as<String>();;
+        horaapagadoTopic1= topicos[5].as<String>();;
+        horaencendidoTopic2= topicos[6].as<String>();;
+        horaapagadoTopic2= topicos[7].as<String>();;
+        fechaCancha1Topic1= topicos[8].as<String>();;
+        fechaCancha2Topic2= topicos[9].as<String>();;
+
+        writeConfig();
+      } else {
+        Serial.println("Error: Número incorrecto de tópicos en 'Topicos'.");
+      }
+    } else {
+      Serial.println("Error: La clave 'Topicos' no está presente en la respuesta.");
+    }
+  } else {
+    Serial.println("Error al registrar el dispositivo.");
+    SPIFFS.format();
+    if (httpResponseCode == -2) {
+      Serial.println("Error: No se pudo conectar con el servidor.");
+      SPIFFS.format();
+    } else if (httpResponseCode == 0) {
+      Serial.println("Error: El servidor no respondió.");
+      SPIFFS.format();
+    } else {
+      Serial.println("Error desconocido.");
+      SPIFFS.format();
+    }
+  }
+  
+  getTimeFromAPI();
+
+}
+int convertirHoraAMinutos(String hora) {
+  int horas = hora.substring(0, 2).toInt();
+  int minutos = hora.substring(3, 5).toInt();
+  return (horas * 60) + minutos;
+}
+void sendhora(String estado, String topic) {
+  int horaEnMinutos = convertirHoraAMinutos(estado);  // Convertir `estado` (hh:mm) a minutos
+
+  HttpClient https(espClientSecure, serverAddress, port);
+  String luzurl = String("/") + topic + "/?dato=" + String(horaEnMinutos);
+
+
+  https.post(luzurl, "application/json", "");
+  int luzStatus = https.responseStatusCode();
+
+
+  https.stop();
+}
+// Modificar la función sendfecha para aceptar un array de int
+void sendfecha(const std::vector<int>& diasArray, const String& topic) {
+    HttpClient https(espClientSecure, serverAddress, port);
+
+    String diasConfigurados = "[";
+    for (size_t i = 0; i < diasArray.size(); i++) {
+        diasConfigurados += String(diasArray[i]);  // Convertir cada número de día a string
+        if (i < diasArray.size() - 1) {
+            diasConfigurados += ",";  // Añadir una coma entre los días, excepto después del último
+        }
+    }
+    diasConfigurados += "]";  // Cerrar los corchetes
+
+    // Construir la URL con los días configurados
+    String url = String("/") + topic + "/?dato=" + String(diasConfigurados);
+
+    // Enviar los días configurados
+    https.post(url, "application/json", "");
+    int status = https.responseStatusCode();
+    https.stop();
+}
+
+
+void sendControl(bool estado){
+  HttpClient https(espClientSecure, serverAddress, port);
+
+  String motorUrl = String("/") + ManualTopic + "/?dato=" + String(estado);
+  https.post(motorUrl, "application/json", "");
+  int motorStatus = https.responseStatusCode();
+  https.stop();
+}
+
+void sendLuzCancha1(bool estado, String topic){
+  HttpClient https(espClientSecure, serverAddress, port);
+
+  String luzUrl = String("/") + topic + "/?dato=" + String(estado);
+  https.post(luzUrl, "application/json", "");
+  int luzStatus = https.responseStatusCode();
+
+  https.stop();
+}
+
+void sendLuzCancha2(bool estado, String topic){
+  HttpClient https(espClientSecure, serverAddress, port);
+
+  String luzUrl = String("/") + topic + "/?dato=" + String(estado);
+
+  https.post(luzUrl, "application/json", "");
+  int luzStatus = https.responseStatusCode();
+
+  https.stop();
+}
+
+// Función para leer la configuración desde SPIFFS
+bool readConfig() {
+  File configFile = SPIFFS.open(configFilePath, "r");
+  if (!configFile) {
+    Serial.println("Error al abrir el archivo de configuración.");
+    return false;
+  }
+
+  size_t size = configFile.size();
+  if (size > 5000) {
+    Serial.println("Archivo de configuración demasiado grande.");
+    return false;
+  }
+
+  std::unique_ptr<char[]> buf(new char[size]);
+  configFile.readBytes(buf.get(), size);
+  configFile.close();
+
+  StaticJsonDocument<5000> doc;
+  DeserializationError error = deserializeJson(doc, buf.get());
+
+  if (error) {
+    Serial.println("Error al parsear el archivo de configuración.");
+    return false;
+  }
+
+  ssid = doc["ssid"].as<String>();
+  password = doc["password"].as<String>();
+  Luz1Topic = doc["Luz1Topic"].as<String>();
+  Luz2Topic = doc["Luz2Topic"].as<String>();
+  conexionTopic = doc["conexionTopic"].as<String>();
+  ManualTopic= doc["ManualTopic"].as<String>();
+  horaencendidoTopic1= doc["horaencendidoTopic1"].as<String>();
+  horaapagadoTopic1= doc["horaapagadoTopic1"].as<String>();
+  horaencendidoTopic2= doc["horaencendidoTopic2"].as<String>();
+  horaapagadoTopic2= doc["horaapagadoTopic2"].as<String>();
+  fechaCancha1Topic1= doc["fechaCancha1Topic1"].as<String>();
+  fechaCancha2Topic2= doc["fechaCancha2Topic2"].as<String>();
+
+  isRegistered = doc["isRegistered"].as<bool>();
+
+  horaInicioCancha1=doc["horaInicioCancha1"].as<String>();
+  horaApagadoCancha1=doc["horaApagadoCancha1"].as<String>();
+  horaInicioCancha2=doc["horaInicioCancha2"].as<String>();
+  horaApagadoCancha2=doc["horaApagadoCancha2"].as<String>();
+  horaInicioCancha2=doc["horaInicioCancha2"].as<String>();
+  
+  luz1on = doc["luz1on"].as<bool>();
+  luz2on = doc["luz2on"].as<bool>();
+
+  // Procesar diasCancha1Array
+  if (doc.containsKey("diasCancha1Array")) {
+        JsonArray array1 = doc["diasCancha1Array"].as<JsonArray>();
+        diasCancha1Array.clear();  // Limpiar el vector antes de llenarlo
+        for (JsonVariant v : array1) {
+            diasCancha1Array.push_back(v.as<int>());
+        }
+    }
+
+    // Procesar diasCancha2Array
+  if (doc.containsKey("diasCancha2Array")) {
+        JsonArray array2 = doc["diasCancha2Array"].as<JsonArray>();
+        diasCancha2Array.clear();
+        for (JsonVariant v : array2) {
+            diasCancha2Array.push_back(v.as<int>());
+        }
+    }
+  return true;
+}
+
+
+// Función para escribir la configuración en SPIFFS
+bool writeConfig() {
+  StaticJsonDocument<5000> doc;
+
+  // Guardar credenciales WiFi
+  doc["ssid"] = ssid;
+  doc["password"] = password;
+
+  // Guardar tópicos
+  doc["Luz1Topic"] = Luz1Topic;
+  doc["Luz2Topic"] = Luz2Topic;
+  doc["conexionTopic"] = conexionTopic;
+  doc["ManualTopic"] = ManualTopic;
+  doc["horaapagadoTopic1"] = horaapagadoTopic1;
+  doc["horaencendidoTopic1"] = horaencendidoTopic1;
+  
+  doc["horaapagadoTopic2"] = horaapagadoTopic2;
+  doc["horaencendidoTopic2"] = horaencendidoTopic2;
+
+  doc["fechaCancha1Topic1"] = fechaCancha1Topic1;
+  doc["fechaCancha2Topic2"] = fechaCancha2Topic2;
+
+  // Guardar el estado de registro
+  doc["isRegistered"] = isRegistered;
+
+  doc["horaInicioCancha1"] = horaInicioCancha1;
+  doc["horaApagadoCancha1"] = horaApagadoCancha1;
+  doc["horaInicioCancha2"] = horaInicioCancha2;
+  doc["horaApagadoCancha2"] = horaApagadoCancha2;
+
+  // Serializar diasCancha1Array y diasCancha2Array
+    JsonArray diasCancha1ArrayJson = doc.createNestedArray("diasCancha1Array");
+    for (int dia : diasCancha1Array) {
+        diasCancha1ArrayJson.add(dia);
+    }
+
+    JsonArray diasCancha2ArrayJson = doc.createNestedArray("diasCancha2Array");
+    for (int dia : diasCancha2Array) {
+        diasCancha2ArrayJson.add(dia);
+    }
+
+  doc["luz1on"] = luz1on;
+  doc["luz2on"] = luz2on;
+
+  File configFile = SPIFFS.open(configFilePath, "w");
+  if (!configFile) {
+    Serial.println("Error al abrir el archivo de configuración para escribir.");
+    return false;
+  }
+
+  serializeJson(doc, configFile);
+  configFile.close();
+  return true;
+}
+
+// Iniciar el servidor web para la configuración
+void startWebServer() {
+  server.on("/", HTTP_GET, []() {
+
+    // Extraer el parámetro 'userId' (JWT Token) desde la URL
+    if (server.hasArg("userId")) {
+      jwt_token = server.arg("userId");
+      Serial.println("JWT Token recibido: ");
+      Serial.println(jwt_token);
+    } else {
+      Serial.println("No se recibió el JWT Token.");
+    }
+
+
+    String page = R"=====( 
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Mciot - Configuración de Dispositivo</title>
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --primary-color: #221e1f;
+                --secondary-color: #e2e2e1;
+                --accent-color: #2755a2;
+                --text-color: #333;
+            }
+            body {
+                font-family: 'Montserrat', sans-serif;
+                margin: 0;
+                padding: 0;
+                line-height: 1.6;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                background-color: var(--secondary-color);
+                color: var(--text-color);
+            }
+            header {
+                background-color: var(--primary-color);
+                color: var(--secondary-color);
+                padding: 1rem;
+                text-align: center;
+            }
+            .logo {
+                font-size: 1.5rem;
+                font-weight: bold;
+            }
+            main {
+                flex-grow: 1;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 2rem;
+            }
+            .card {
+                background-color: white;
+                border-radius: 0.5rem;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                padding: 2rem;
+                max-width: 400px;
+                width: 100%;
+            }
+            h1 {
+                color: var(--accent-color);
+                font-size: 1.5rem;
+                margin-bottom: 1.5rem;
+                text-align: center;
+            }
+            label {
+                display: block;
+                margin-bottom: 0.5rem;
+                font-weight: 600;
+            }
+            select, input {
+                width: 100%;
+                padding: 0.75rem;
+                margin-bottom: 1.25rem;
+                border: 1px solid var(--accent-color);
+                border-radius: 0.375rem;
+                font-size: 1rem;
+                transition: border-color 0.3s, box-shadow 0.3s;
+            }
+            select:focus, input:focus {
+                outline: none;
+                border-color: var(--accent-color);
+                box-shadow: 0 0 0 3px rgba(39, 85, 162, 0.2);
+            }
+            .password-container {
+                position: relative;
+            }
+            .password-toggle {
+                position: absolute;
+                right: 10px;
+                top: 50%;
+                transform: translateY(-50%);
+                background: none;
+                border: none;
+                cursor: pointer;
+                color: var(--accent-color);
+            }
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 100%;
+                padding: 0.75rem;
+                background-color: var(--accent-color);
+                color: white;
+                border: none;
+                border-radius: 0.375rem;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background-color 0.3s;
+            }
+            .btn:hover {
+                background-color: #1c3f7c;
+            }
+            @media (max-width: 480px) {
+                .card {
+                    padding: 1.5rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <header>
+            <div class="logo">Mciot</div>
+        </header>
+        <main>
+            <div class="card">
+                <h1>Configurar Dispositivo</h1>
+                <form id="wifiForm" method="POST" action="/conectar">
+                    <label for="deviceName">Nombre del Dispositivo</label>
+                    <input type="text" id="deviceName" name="deviceName" required>
+
+                    <label for="wifiNetwork">Red Wi-Fi</label>
+                    <select id="wifiNetwork" name="wifiNetwork" required>
+                        <option value="" disabled selected>Seleccione una red Wi-Fi</option>
+                    </select>
+
+                    <label for="wifiPassword">Contraseña Wi-Fi</label>
+                    <div class="password-container">
+                        <input type="password" id="wifiPassword" name="wifiPassword" required>
+                        <button type="button" class="password-toggle" onclick="togglePassword()">Mostrar</button>
+                    </div>
+
+                    <input type="hidden" id="userId" name="userId" value=")=====" + jwt_token + R"=====(">
+                    <button type="submit" class="btn">Configurar Dispositivo</button>
+                </form>
+            </div>
+        </main>
+        <script>
+            function obtenerRedesWiFi() {
+                const wifiNetworks = [];
+                // Simular escaneo de redes desde el backend en JavaScript
+                %WIFI_SCAN%
+
+                const selectElement = document.getElementById('wifiNetwork');
+                wifiNetworks.forEach(red => {
+                    const option = document.createElement('option');
+                    option.value = red;
+                    option.text = red;
+                    selectElement.add(option);
+                });
+            }
+
+            function togglePassword() {
+                const passwordInput = document.getElementById('wifiPassword');
+                const toggleButton = document.querySelector('.password-toggle');
+                if (passwordInput.type === 'password') {
+                    passwordInput.type = 'text';
+                    toggleButton.textContent = 'Ocultar';
+                } else {
+                    passwordInput.type = 'password';
+                    toggleButton.textContent = 'Mostrar';
+                }
+            }
+
+            window.onload = obtenerRedesWiFi;
+        </script>
+    </body>
+    </html>
+    )=====";
+
+    page.replace("%WIFI_SCAN%", generateWifiScanScript());
+    server.send(200, "text/html", page);
+  });
+
+  // Ruta para intentar conectar a una red WiFi
+  server.on("/conectar", HTTP_POST, []() {
+    ssid = server.arg("wifiNetwork");
+    password = server.arg("wifiPassword");
+    // Intentar conectar al WiFi
+    WiFi.begin(ssid.c_str(), password.c_str());
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 30) {
+      delay(500);
+      retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      server.send(200, "application/json", "{\"resultado\":1}");  // Conexión exitosa
+      jwt_token = server.arg("userId");
+      nombre=server.arg("deviceName");
+      Serial.println("SE CONECTO CON EXITO DESDE LA PAGINA : ");
+      Serial.println(jwt_token);
+      Serial.println(nombre);// Registrar el dispositivo y obtener los tópicos
+      registerDevice();
+      // Guardar la configuración en SPIFFS
+      if (writeConfig()) {
+        server.send(200, "application/json", "{\"resultado\":1, \"mensaje\":\"Configuración guardada\"}");
+      } else {
+        server.send(500, "application/json", "{\"resultado\":0, \"mensaje\":\"Error al guardar configuración\"}");
+      }
+    } else {
+      server.send(200, "application/json", "{\"resultado\":0}");  // Falló la conexión
+    }
+  });
+
+  server.begin();
+}
+// Función para generar el código de escaneo de Wi-Fi directamente en el script
+String generateWifiScanScript() {
+  String script = "wifiNetworks.push(";
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; ++i) {
+    if (i > 0) {
+      script += ",";
+    }
+    script += "\"" + WiFi.SSID(i) + "\"";
+  }
+  script += ");";
+  return script;
+}
+
+
+// Conectar al WiFi
+bool connectWifi() {
+  Serial.println("Escaneando redes WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("No se encontraron redes WiFi.");
+  } else {
+    Serial.print(n);
+    Serial.println(" redes encontradas.");
+    for (int i = 0; i < n; ++i) {
+      Serial.printf("%d: %s (%d) %s\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i), 
+              (WiFi.encryptionType(i) == AUTH_OPEN) ? "Abierta" : "Encriptada");
+    }
+  }
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.println("Conectando a WiFi...");
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi conectado.");
+    Serial.print("Dirección IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("No se pudo conectar a WiFi.");
+    return false;
+  }
+}
+
+
+// Función para manejar los mensajes MQTT entrantes
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Mensaje recibido [");
+  Serial.print(topic);
+  Serial.print("] ");
+  for (unsigned int i = 0; i < length; i++) {
+    Serial.print((char)payload[i]);
+  }
+
+  String messageTopic = String(topic);
+  String messagePayload = "";
+  for (unsigned int i = 0; i < length; i++) {
+    messagePayload += (char)payload[i];
+  }
+  Serial.println(messagePayload);
+
+  bool horarioActualizado = false;
+
+  // Control manual de luces para cancha 1
+  if (messageTopic == Luz1Topic) {
+    if (messagePayload == "True" && controlmanual == true) {
+      digitalWrite(releLuz1, LOW);  // Encender luz cancha 1
+      luz1on = true;
+      sendLuzCancha1(luz1on, Luz1Topic);
+    } else if (messagePayload == "False" && controlmanual == true) {
+      digitalWrite(releLuz1, HIGH);  // Apagar luz cancha 1
+      luz1on = false;
+      sendLuzCancha1(luz1on, Luz1Topic);
+
+    }
+
+  // Control manual de luces para cancha 2
+  } else if (messageTopic == Luz2Topic) {
+    if (messagePayload == "True" && controlmanual == true) {
+      digitalWrite(releLuz2, LOW);  // Encender luz cancha 2
+      luz2on = true;
+      sendLuzCancha2(luz2on, Luz2Topic);
+    } else if (messagePayload == "False" && controlmanual == true) {
+      digitalWrite(releLuz2, HIGH);  // Apagar luz cancha 2
+      luz2on = false;
+      sendLuzCancha2(luz2on, Luz2Topic);
+    }
+
+  // Control manual general
+  } else if (messageTopic == ManualTopic) {
+    if (messagePayload == "True") {
+      controlmanual = true;
+      sendControl(controlmanual);
+    } else if (messagePayload == "False") {
+      controlmanual = false;
+      sendControl(controlmanual);
+    }
+  
+  // Ajustar hora de inicio y apagado para cancha 1
+  } else if (messageTopic == horaencendidoTopic1 || messageTopic == horaapagadoTopic1 || messageTopic == fechaCancha1Topic1)  {
+    if (messageTopic == horaencendidoTopic1 && horaInicioCancha1 != messagePayload) {
+      horaInicioCancha1 = messagePayload;  // Recibe la hora en formato "HH:MM"
+      Serial.print("Hora de inicio cancha 1 ajustada a: ");
+      Serial.println(horaInicioCancha1);
+      sendhora(horaInicioCancha1,horaencendidoTopic1);
+      horarioActualizado = true;
+    } else if (messageTopic == horaapagadoTopic1 && horaApagadoCancha1 != messagePayload) {
+      horaApagadoCancha1 = messagePayload;  // Recibe la hora en formato "HH:MM"
+      Serial.print("Hora de apagado cancha 1 ajustada a: ");
+      Serial.println(horaApagadoCancha1);
+      horarioActualizado = true;
+      sendhora(horaApagadoCancha1,horaapagadoTopic1);
+    }
+    if (messageTopic == fechaCancha1Topic1) {
+    procesarDiasCancha(messagePayload, diasCancha1Array);  // Procesar los días recibidos para cancha 1
+    numDiasCancha1 = diasCancha1Array.size();
+    sendfecha(diasCancha1Array,fechaCancha1Topic1);
+    }
+
+  // Ajustar hora de inicio y apagado para cancha 2
+  } else if (messageTopic == horaencendidoTopic2 || messageTopic == horaapagadoTopic2 || messageTopic == fechaCancha2Topic2) {
+    if (messageTopic == horaencendidoTopic2 && horaInicioCancha2 != messagePayload) {
+      horaInicioCancha2 = messagePayload;  // Recibe la hora en formato "HH:MM"
+      Serial.print("Hora de inicio cancha 2 ajustada a: ");
+      Serial.println(horaInicioCancha2);
+      sendhora(horaInicioCancha2,horaencendidoTopic2);
+  
+      horarioActualizado = true;
+    } else if (messageTopic == horaapagadoTopic2 && horaApagadoCancha2 != messagePayload) {
+      horaApagadoCancha2 = messagePayload;  // Recibe la hora en formato "HH:MM"
+      Serial.print("Hora de apagado cancha 2 ajustada a: ");
+      Serial.println(horaApagadoCancha2);
+      horarioActualizado = true;
+      sendhora(horaApagadoCancha2,horaapagadoTopic2);
+    } 
+    if(messageTopic == fechaCancha2Topic2) {
+      procesarDiasCancha(messagePayload, diasCancha2Array);  // Procesar los días recibidos para cancha 2
+      numDiasCancha2 = diasCancha2Array.size();
+      sendfecha(diasCancha2Array,fechaCancha2Topic2);
+    }
+  }
+  writeConfig();
+}
+
+
+
+void reconnectMQTT() {
+  if (offlineMode) return;  // No reconectar si estamos en modo offline
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastReconnectAttempt >= reconnectInterval) {
+    lastReconnectAttempt = currentMillis;
+
+    if (!client.connected()) {
+      Serial.println("Conectando al broker MQTT...");
+
+      // Intentar conectar al broker MQTT
+      if (client.connect(conexionTopic.c_str(), conexionTopic.c_str(), 0, true, "0")) {
+        Serial.println("Conectado a MQTT");
+        failedReconnectAttempts = 0;
+
+        // Publicar y suscribirse a los tópicos necesarios
+        client.publish(conexionTopic.c_str(), "1", true);
+        client.publish(Luz2Topic.c_str(), "");
+        client.publish(Luz1Topic.c_str(), "");
+        client.publish(ManualTopic.c_str(), "");
+        client.publish(horaapagadoTopic1.c_str(), "");
+        client.publish(horaencendidoTopic1.c_str(), "");
+        client.publish(horaapagadoTopic2.c_str(), "");
+        client.publish(horaencendidoTopic2.c_str(), "");
+        client.publish(fechaCancha1Topic1.c_str(), "");
+        client.publish(fechaCancha2Topic2.c_str(), "");
+        client.subscribe(fechaCancha1Topic1.c_str());
+        client.subscribe(fechaCancha2Topic2.c_str());
+        client.subscribe(Luz2Topic.c_str());
+        client.subscribe(Luz1Topic.c_str());
+        client.subscribe(ManualTopic.c_str());
+        client.subscribe(horaencendidoTopic1.c_str());
+        client.subscribe(horaapagadoTopic1.c_str());
+        client.subscribe(horaencendidoTopic2.c_str());
+        client.subscribe(horaapagadoTopic2.c_str());
+
+      } else {
+        // Fallo en la conexión al broker MQTT
+        failedReconnectAttempts++;
+        Serial.print("Falló la conexión MQTT, rc=");
+        Serial.println(client.state());
+
+        // Si se alcanzan los intentos máximos, seguir intentando pero sin entrar en modo offline
+        if (failedReconnectAttempts >= maxReconnectAttempts && WiFi.status() == WL_CONNECTED) {
+          Serial.println("Máximo número de intentos alcanzado, seguir intentando reconectar al MQTT.");
+          ESP.restart();
+        }
+      }
+    }
+  }
+}
+
+
+void handleOfflineMode(unsigned long currentMillis) {
+  // Verificar si es tiempo de ejecutar las tareas
+  if (currentMillis - previousMillis >= 30000) {  // Cada 30 segundos
+    previousMillis = currentMillis;
+    obtenerHoraActual();
+    verificarHorario();
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  
+  if (!SPIFFS.begin()) {
+    Serial.println("Error al montar SPIFFS");
+    startAPMode();
+    return;
+  }
+    // Leer configuración de SPIFFS
+  if (!readConfig()) {
+    startAPMode();
+    return;
+  }
+
+  if (!rtc.begin()) {
+    Serial.println("RTC no encontrado, verifique la conexión.");
+  } else {
+    Serial.println("RTC iniciado correctamente.");
+  }
+
+  espClientSecure.setInsecure();  // Asegura la conexión HTTPS, pero sin verificación del certificado
+  pinMode(releLuz1, OUTPUT);
+  pinMode(releLuz2, OUTPUT);
+
+  // Conectar a WiFi
+  if (!connectWifi()) {
+    Serial.println("No hay conexión WiFi, iniciando en modo offline...");
+    offlineMode = true;  // Activar modo offline si no se puede conectar al WiFi
+  } else {
+    // Configurar MQTT server si hay conexión WiFi
+    client.setServer(serverAddress, 1883);
+    client.setCallback(callback);  // Establece la función de callback para manejar los mensajes entrantes
+    reconnectMQTT();  // Intentar conectar al broker MQTT
+  }
+
+  getTimeFromAPI();
+
+  // Enviar datos iniciales
+  sendhora(horaApagadoCancha1, horaapagadoTopic1);
+  sendhora(horaApagadoCancha2, horaapagadoTopic2);
+  sendhora(horaInicioCancha1, horaencendidoTopic1);
+  sendhora(horaInicioCancha2, horaencendidoTopic2);
+
+  sendControl(controlmanual);
+  Serial.println("Dias Funcion Setup.");
+  imprimirArreglo(diasCancha1Array);
+  imprimirArreglo(diasCancha2Array);
+
+  // Estado inicial de luces
+  digitalWrite(releLuz1, luz1on ? LOW : HIGH);
+  digitalWrite(releLuz2, luz2on ? LOW : HIGH);
+
+  sendLuzCancha2(luz2on, Luz2Topic);
+  sendLuzCancha1(luz1on, Luz1Topic);
+
+  // Iniciar el servidor web
+  startWebServer();
+
+  numDiasCancha1 = diasCancha1Array.size();
+  numDiasCancha2 = diasCancha2Array.size();
+}
+
+
+
+
+void loop() {
+  server.handleClient();
+
+  // Verificar la conexión WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    // Si el WiFi está conectado, no debe activarse el modo offline
+    if (offlineMode) {
+      Serial.println("WiFi reconectado, saliendo del modo offline...");
+      offlineMode = false;
+      failedReconnectAttempts = 0;  // Reiniciar el contador de reconexiones fallidas
+      reconnectMQTT();  // Intentar reconectar al broker MQTT
+    }
+
+    // Mantener la conexión MQTT activa
+    if (client.connected()) {
+      client.loop();
+    } else {
+      reconnectMQTT();  // Intentar reconectar a MQTT si no está conectado
+    }
+
+    // Verificar si es tiempo de enviar datos (cada 30 segundos)
+    unsigned long currentMillis = millis();
+    if (currentMillis - previousMillis >= 30000) {
+      previousMillis = currentMillis;
+      obtenerHoraActual();
+      verificarHorario();
+    }
+  } else {
+    // No hay conexión WiFi
+    Serial.println("WiFi desconectado, activando modo offline...");
+    offlineMode = true;
+
+    // Intentar reconectar al WiFi
+    if (connectWifi()) {
+      Serial.println("WiFi reconectado");
+      failedReconnectAttempts = 0;  // Reiniciar contador
+      reconnectMQTT();  // Intentar reconectar a MQTT si WiFi vuelve
+    } else {
+      unsigned long currentMillis = millis();
+      // Ejecutar lógica en modo offline (sin WiFi)
+      Serial.println("Modo Automatico Activado funcionando sin conexion");
+      handleOfflineMode(currentMillis);
+    }
+  }
+}
+
+
+

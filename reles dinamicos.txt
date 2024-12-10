@@ -1,0 +1,772 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FS.h> // Añadido para SPIFFS
+#include <HttpClient.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
+#include <WiFiClient.h>
+
+
+// Definición del servidor web
+ESP8266WebServer server(80);
+
+// Cliente MQTT
+WiFiClientSecure espClientSecure;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Variables de configuración WiFi
+String ssid;
+String password;
+
+// Configuración del servidor Flask
+const char* serverAddress = "sjrc.com.ar";  // Cambia esto a la dirección IP de tu servidor
+const int port = 443;
+
+// Configuración del dispositivo  
+String jwt_token = "";      // ID del usuario
+String nombre = "";  
+
+unsigned long previousAlertMillis = 0;
+
+
+String releTopic;
+String conexionTopic;
+
+// Ruta del archivo de configuración
+const char* configFilePath = "/config.json";
+
+
+//Bandera Registro unico
+bool isRegistered = false; 
+
+
+int failedReconnectAttempts = 0;
+const int maxReconnectAttempts = 3;
+bool offlineMode = false;  // Modo offline solo si no hay WiFi
+unsigned long lastReconnectAttempt = 0;  // Último intento de reconexión a MQTT
+const unsigned long reconnectInterval = 5000;  // Intentar reconectar cada 5 segundos (5000 ms)
+const int mqttKeepAlive = 15;  // Configurar keep-alive en 15 segundos
+
+// Milis para verificar el tiempo
+unsigned long previousMillis = 0;
+
+
+class Reles {
+public:
+  String nombre;
+  bool estado;
+  int pin;
+
+  Reles(String nombre, int pin) : nombre(nombre), estado(false), pin(pin) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);  // Inicializa el relé apagado
+  }
+
+  void cambiarEstado(bool nuevoEstado) {
+    estado = nuevoEstado;
+    digitalWrite(pin, estado ? LOW : HIGH);
+  }
+
+  void cambiarNombre(const String& nuevoNombre) {
+    nombre = nuevoNombre;
+  }
+};
+
+// Arreglo de objetos Reles
+Reles reles[8] = {
+  Reles("Rele1", 16),
+  Reles("Rele2", 5),
+  Reles("Rele3", 4),
+  Reles("Rele4", 2),
+  Reles("Rele5", 14),
+  Reles("Rele6", 12),
+  Reles("Rele7", 13),
+  Reles("Rele8", 15)
+};
+
+
+void registerDevice() {
+  if (isRegistered) {
+    Serial.println("Dispositivo ya registrado, omitiendo el registro.");
+    return;  // Si ya está registrado, no hacer nada
+  }
+
+  HttpClient https(espClientSecure, serverAddress, port);
+  String ipAddress = WiFi.localIP().toString();
+  String registerUrl = String("/nuevo_dispositivo");
+
+   String payload = "{\"ip\":\"" + ipAddress + "\",\"nombre\":\"" + nombre + "\","
+                 "\"Topicos\":{\"estado\":[\"conexion\"],"
+                 "\"accion\":[\"Rele8-on-off-v2\"]}}";
+
+  // Enviar solicitud POST con JWT en las cabeceras
+  https.beginRequest();
+  https.post(registerUrl);
+  https.sendHeader("Authorization", "Bearer " + jwt_token);  // Enviar JWT en cabecera
+  https.sendHeader("Content-Type", "application/json");
+  https.sendHeader("Content-Length", payload.length());
+  https.write((const byte*)payload.c_str(), payload.length());
+  https.endRequest();
+  
+  int httpResponseCode = https.responseStatusCode();
+  String response = https.responseBody();
+
+  Serial.print("Código de respuesta HTTP: ");
+  Serial.println(httpResponseCode);
+  Serial.print("Respuesta del servidor: ");
+  Serial.println(response);
+
+  if (httpResponseCode == 201) {
+    Serial.println("Dispositivo registrado correctamente.");
+    Serial.println("Respuesta: " + response);
+    isRegistered = true;  // Marcar como registrado
+
+    StaticJsonDocument<1024> doc;
+    DeserializationError error = deserializeJson(doc, response);
+
+    if (error) {
+      Serial.println("Error al parsear la respuesta JSON.");
+      return;
+    }
+
+    if (doc.containsKey("Topicos")) {
+      JsonArray topicos = doc["Topicos"];
+
+      if (topicos.size() >= 2) {
+        conexionTopic = topicos[0].as<String>();
+        releTopic = topicos[1].as<String>();
+        Serial.println("WiFi Topic: " + conexionTopic);
+        Serial.println("rele Topic: " + releTopic);
+        writeConfig();
+      } else {
+        Serial.println("Error: Número incorrecto de tópicos en 'Topicos'.");
+      }
+    } else {
+      Serial.println("Error: La clave 'Topicos' no está presente en la respuesta.");
+    }
+  } else {
+    Serial.println("Error al registrar el dispositivo.");
+    if (httpResponseCode == -2) {
+      Serial.println("Error: No se pudo conectar con el servidor.");
+    } else if (httpResponseCode == 0) {
+      Serial.println("Error: El servidor no respondió.");
+    } else {
+      Serial.println("Error desconocido.");
+    }
+  }
+}
+
+void sendRelesData() {
+  HttpClient https(espClientSecure, serverAddress, port);
+
+  // Creamos el JSON con el arreglo de relés
+  StaticJsonDocument<512> doc; // Asegúrate de tener suficiente tamaño para todos los datos
+  JsonArray relesArray = doc.createNestedArray("reles");
+
+  // Añadimos cada relé al JSON
+  for (int i = 0; i < 8; i++) {
+    JsonObject releData = relesArray.createNestedObject();
+    releData["nombre"] = reles[i].nombre;
+    releData["estado"] = reles[i].estado;
+    releData["pin"] = reles[i].pin;
+  }
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);  // Convertimos el JSON a un string
+
+  // URL de la API que recibirá el JSON
+  String relesUrl = String("/") + releTopic;
+  Serial.println("URL para el envío de relés: " + relesUrl);
+
+  // Hacemos el POST con el JSON
+  https.post(relesUrl, "application/json", jsonPayload);
+
+  int relesStatus = https.responseStatusCode();
+  if (relesStatus > 0) {
+    Serial.println("Datos de relés enviados: " + jsonPayload);
+  } else {
+    Serial.println("Error al enviar los datos de relés.");
+  }
+  https.stop();
+}
+
+
+// Función para leer la configuración desde SPIFFS
+bool readConfig() {
+  File configFile = SPIFFS.open(configFilePath, "r");
+  if (!configFile) {
+    Serial.println("Error al abrir el archivo de configuración.");
+    return false;
+  }
+
+  size_t size = configFile.size();
+  if (size > 1024) {
+    Serial.println("Archivo de configuración demasiado grande.");
+    return false;
+  }
+
+  std::unique_ptr<char[]> buf(new char[size]);
+  configFile.readBytes(buf.get(), size);
+  configFile.close();
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError error = deserializeJson(doc, buf.get());
+
+  if (error) {
+    Serial.println("Error al parsear el archivo de configuración.");
+    return false;
+  }
+
+  ssid = doc["ssid"].as<String>();
+  password = doc["password"].as<String>();
+  conexionTopic = doc["conexionTopic"].as<String>();
+  releTopic = doc["releTopic"].as<String>();
+
+
+  JsonArray relesArray = doc.as<JsonArray>();
+  for (int i = 0; i < relesArray.size() && i < 8; i++) {
+    reles[i].nombre = relesArray[i]["nombre"].as<String>();
+    reles[i].estado = relesArray[i]["estado"].as<bool>();
+    reles[i].pin = relesArray[i]["pin"].as<int>();
+    pinMode(reles[i].pin, OUTPUT);
+    digitalWrite(reles[i].pin, reles[i].estado ? LOW : HIGH); // Restaurar el estado del relé
+  }
+
+
+  return true;
+}
+
+
+// Función para escribir la configuración en SPIFFS
+bool writeConfig() {
+  StaticJsonDocument<1024> doc;
+  
+  // Guardar credenciales WiFi
+  doc["ssid"] = ssid;
+  doc["password"] = password;
+  
+  // Guardar tópicos
+  doc["releTopic"] = releTopic;
+  doc["conexionTopic"] = conexionTopic;  
+  // Guardar el estado de registro
+  doc["isRegistered"] = isRegistered;
+
+
+  // Añadir cada relé al array JSON
+  JsonArray relesArray = doc.createNestedArray("reles");
+  for (int i = 0; i < 8; i++) {
+      JsonObject releObj = relesArray.createNestedObject();
+      releObj["nombre"] = reles[i].nombre;
+      releObj["estado"] = reles[i].estado;
+      releObj["pin"] = reles[i].pin;
+  }
+
+
+  File configFile = SPIFFS.open(configFilePath, "w");
+  if (!configFile) {
+    Serial.println("Error al abrir el archivo de configuración para escribir.");
+    return false;
+  }
+
+  serializeJson(doc, configFile);
+  configFile.close();
+  return true;
+}
+void callback(char* topic, byte* payload, unsigned int length) {
+  bool band = false;
+  int i = 0;
+
+  // Convierte el payload a un String
+  String messagePayload;
+  for (unsigned int j = 0; j < length; j++) {
+    messagePayload += (char)payload[j];
+  }
+
+  // Compara el topic entrante con `releTopic`
+  if (String(topic) == releTopic) {
+    StaticJsonDocument<200> doc;
+    Serial.print("Payload recibido: ");
+    Serial.println(messagePayload);
+
+    // Deserializar el JSON
+    DeserializationError error = deserializeJson(doc, messagePayload);
+
+    if (error) {
+      Serial.print(F("Error al parsear JSON: "));
+      Serial.println(error.f_str());
+      return;
+    }
+
+    Serial.println("LLEGO DATO AL TOPICO RELE");
+
+    // Recorre las claves del JSON
+    for (JsonPair kv : doc.as<JsonObject>()) {
+      String clave = kv.key().c_str();       // Nombre del relé (clave)
+      String valor = kv.value().as<String>(); // Acción (valor)
+
+      // Verificar si la clave coincide con el nombre de algún relé
+      i = 0; // Reinicia el índice para cada clave
+      band = false;
+
+      while (i < 8 && !band) {
+        if (clave == reles[i].nombre) {
+          band = true;
+
+          // Procesar la acción
+          if (valor == "True") {
+            reles[i].cambiarEstado(true);  // Encender el relé
+          } else if (valor == "False") {
+            reles[i].cambiarEstado(false);  // Apagar el relé
+          } else {
+            reles[i].cambiarNombre(valor);  // Cambiar el nombre del relé
+          }
+          sendRelesData();
+          writeConfig();
+        } else {
+          i++;
+        }
+      }
+
+      if (!band) {
+        Serial.print("No se encontró el relé especificado para la clave: ");
+        Serial.println(clave);
+      }
+    }
+  }
+}
+
+
+void reconnectMQTT() {
+  if (offlineMode) return;  // No reconectar si estamos en modo offline
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - lastReconnectAttempt >= reconnectInterval) {
+    lastReconnectAttempt = currentMillis;
+
+    if (!client.connected()) {
+      Serial.println("Conectando al broker MQTT...");
+      Serial.println("Conexion topic:");
+      Serial.println(conexionTopic);
+
+      // Intentar conectar al broker MQTT
+      if (client.connect(conexionTopic.c_str(), conexionTopic.c_str(), 0, true, "0")) {
+        Serial.println("Conectado a MQTT");
+        failedReconnectAttempts = 0;
+
+        // Publicar y suscribirse a los tópicos necesarios
+        client.publish(conexionTopic.c_str(), "1", true);  // Estado activo
+        client.subscribe(releTopic.c_str());
+      } else {
+        // Fallo en la conexión al broker MQTT
+        failedReconnectAttempts++;
+        Serial.print("Falló la conexión MQTT, rc=");
+        Serial.println(client.state());
+
+        // Si se alcanzan los intentos máximos, seguir intentando pero sin entrar en modo offline
+        if (failedReconnectAttempts >= maxReconnectAttempts && WiFi.status() == WL_CONNECTED) {
+          Serial.println("Máximo número de intentos alcanzado, seguir intentando reconectar al MQTT.");
+          ESP.restart();
+        }
+      }
+    }
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+///////////WEB SERVER ///////////////////////
+
+// Conectar al WiFi
+bool connectWifi() {
+  Serial.println("Escaneando redes WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n == 0) {
+    Serial.println("No se encontraron redes WiFi.");
+  } else {
+    Serial.print(n);
+    Serial.println(" redes encontradas.");
+    for (int i = 0; i < n; ++i) {
+      Serial.printf("%d: %s (%d) %s\n", i + 1, WiFi.SSID(i).c_str(), WiFi.RSSI(i), 
+              (WiFi.encryptionType(i) == AUTH_OPEN) ? "Abierta" : "Encriptada");
+    }
+  }
+  WiFi.begin(ssid.c_str(), password.c_str());
+  Serial.println("Conectando a WiFi...");
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
+    delay(500);
+    Serial.print(".");
+    retries++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi conectado.");
+    Serial.print("Dirección IP: ");
+    Serial.println(WiFi.localIP());
+    return true;
+  } else {
+    Serial.println("No se pudo conectar a WiFi.");
+    return false;
+  }
+}
+
+
+
+
+void startAPMode() {
+  Serial.println("Iniciando modo AP...");
+  WiFi.softAP("Mciot32");
+
+  IPAddress ip = WiFi.softAPIP();
+  Serial.print("Dirección IP del AP: ");
+  Serial.println(ip);
+
+  startWebServer();  // Inicia el servidor web
+}
+
+
+// Función para generar el código de escaneo de Wi-Fi directamente en el script
+String generateWifiScanScript() {
+  String script = "wifiNetworks.push(";
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; ++i) {
+    if (i > 0) {
+      script += ",";
+    }
+    script += "\"" + WiFi.SSID(i) + "\"";
+  }
+  script += ");";
+  return script;
+}
+
+
+// Iniciar el servidor web para la configuración
+void startWebServer() {
+  server.on("/", HTTP_GET, []() {
+
+    // Extraer el parámetro 'userId' (JWT Token) desde la URL
+    if (server.hasArg("userId")) {
+      jwt_token = server.arg("userId");
+      Serial.println("JWT Token recibido: ");
+      Serial.println(jwt_token);
+    } else {
+      Serial.println("No se recibió el JWT Token.");
+    }
+
+
+    String page = R"=====( 
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Mciot - Configuración de Dispositivo</title>
+        <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --primary-color: #221e1f;
+                --secondary-color: #e2e2e1;
+                --accent-color: #2755a2;
+                --text-color: #333;
+            }
+            body {
+                font-family: 'Montserrat', sans-serif;
+                margin: 0;
+                padding: 0;
+                line-height: 1.6;
+                min-height: 100vh;
+                display: flex;
+                flex-direction: column;
+                background-color: var(--secondary-color);
+                color: var(--text-color);
+            }
+            header {
+                background-color: var(--primary-color);
+                color: var(--secondary-color);
+                padding: 1rem;
+                text-align: center;
+            }
+            .logo {
+                font-size: 1.5rem;
+                font-weight: bold;
+            }
+            main {
+                flex-grow: 1;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                padding: 2rem;
+            }
+            .card {
+                background-color: white;
+                border-radius: 0.5rem;
+                box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                padding: 2rem;
+                max-width: 400px;
+                width: 100%;
+            }
+            h1 {
+                color: var(--accent-color);
+                font-size: 1.5rem;
+                margin-bottom: 1.5rem;
+                text-align: center;
+            }
+            label {
+                display: block;
+                margin-bottom: 0.5rem;
+                font-weight: 600;
+            }
+            select, input {
+                width: 100%;
+                padding: 0.75rem;
+                margin-bottom: 1.25rem;
+                border: 1px solid var(--accent-color);
+                border-radius: 0.375rem;
+                font-size: 1rem;
+                transition: border-color 0.3s, box-shadow 0.3s;
+            }
+            select:focus, input:focus {
+                outline: none;
+                border-color: var(--accent-color);
+                box-shadow: 0 0 0 3px rgba(39, 85, 162, 0.2);
+            }
+            .password-container {
+                position: relative;
+            }
+            .password-toggle {
+                position: absolute;
+                right: 10px;
+                top: 50%;
+                transform: translateY(-50%);
+                background: none;
+                border: none;
+                cursor: pointer;
+                color: var(--accent-color);
+            }
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 100%;
+                padding: 0.75rem;
+                background-color: var(--accent-color);
+                color: white;
+                border: none;
+                border-radius: 0.375rem;
+                font-size: 1rem;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background-color 0.3s;
+            }
+            .btn:hover {
+                background-color: #1c3f7c;
+            }
+            @media (max-width: 480px) {
+                .card {
+                    padding: 1.5rem;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <header>
+            <div class="logo">Mciot</div>
+        </header>
+        <main>
+            <div class="card">
+                <h1>Configurar Dispositivo</h1>
+                <form id="wifiForm" method="POST" action="/conectar">
+                    <label for="deviceName">Nombre del Dispositivo</label>
+                    <input type="text" id="deviceName" name="deviceName" required>
+
+                    <label for="wifiNetwork">Red Wi-Fi</label>
+                    <select id="wifiNetwork" name="wifiNetwork" required>
+                        <option value="" disabled selected>Seleccione una red Wi-Fi</option>
+                    </select>
+
+                    <label for="wifiPassword">Contraseña Wi-Fi</label>
+                    <div class="password-container">
+                        <input type="password" id="wifiPassword" name="wifiPassword" required>
+                        <button type="button" class="password-toggle" onclick="togglePassword()">Mostrar</button>
+                    </div>
+
+                    <input type="hidden" id="userId" name="userId" value=")=====" + jwt_token + R"=====(">
+                    <button type="submit" class="btn">Configurar Dispositivo</button>
+                </form>
+            </div>
+        </main>
+        <script>
+            function obtenerRedesWiFi() {
+                const wifiNetworks = [];
+                // Simular escaneo de redes desde el backend en JavaScript
+                %WIFI_SCAN%
+
+                const selectElement = document.getElementById('wifiNetwork');
+                wifiNetworks.forEach(red => {
+                    const option = document.createElement('option');
+                    option.value = red;
+                    option.text = red;
+                    selectElement.add(option);
+                });
+            }
+
+            function togglePassword() {
+                const passwordInput = document.getElementById('wifiPassword');
+                const toggleButton = document.querySelector('.password-toggle');
+                if (passwordInput.type === 'password') {
+                    passwordInput.type = 'text';
+                    toggleButton.textContent = 'Ocultar';
+                } else {
+                    passwordInput.type = 'password';
+                    toggleButton.textContent = 'Mostrar';
+                }
+            }
+
+            window.onload = obtenerRedesWiFi;
+        </script>
+    </body>
+    </html>
+    )=====";
+
+    page.replace("%WIFI_SCAN%", generateWifiScanScript());
+    server.send(200, "text/html", page);
+  });
+
+  // Ruta para intentar conectar a una red WiFi
+  server.on("/conectar", HTTP_POST, []() {
+    ssid = server.arg("wifiNetwork");
+    password = server.arg("wifiPassword");
+    // Intentar conectar al WiFi
+    WiFi.begin(ssid.c_str(), password.c_str());
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 30) {
+      delay(500);
+      retries++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      server.send(200, "application/json", "{\"resultado\":1}");  // Conexión exitosa
+      jwt_token = server.arg("userId");
+      nombre=server.arg("deviceName");
+      Serial.println("SE CONECTO CON EXITO DESDE LA PAGINA : ");
+      Serial.println(jwt_token);
+      Serial.println(nombre);// Registrar el dispositivo y obtener los tópicos
+      registerDevice();
+      // Guardar la configuración en SPIFFS
+      if (writeConfig()) {
+        server.send(200, "application/json", "{\"resultado\":1, \"mensaje\":\"Configuración guardada\"}");
+      } else {
+        server.send(500, "application/json", "{\"resultado\":0, \"mensaje\":\"Error al guardar configuración\"}");
+      }
+    } else {
+      server.send(200, "application/json", "{\"resultado\":0}");  // Falló la conexión
+    }
+  });
+
+  server.begin();
+}
+
+
+
+/////////////////////////FIN WEB SERVER/////////////////////////
+
+
+
+
+
+void setup() {
+  Serial.begin(9600);
+  
+  if (!SPIFFS.begin()) {
+    Serial.println("Error al montar SPIFFS");
+    startAPMode();
+    return;
+  }
+
+  espClientSecure.setInsecure();  // Asegura la conexión HTTPS, pero sin verificación del certificado
+
+
+  // Leer configuración de SPIFFS
+  if (!readConfig()) {
+    startAPMode();
+    return;
+  }
+
+  // Conectar a WiFi
+  if (!connectWifi()) {
+    Serial.println("No hay conexión WiFi, iniciando en modo offline...");
+    offlineMode = true;  // Activar modo offline si no se puede conectar al WiFi
+  } else {
+   // Configurar MQTT server si hay conexión WiFi
+    client.setServer(serverAddress,1883);
+    client.setCallback(callback);  // Establece la función de callback para manejar los mensajes entrantes
+    reconnectMQTT();  // Intentar conectar al broker MQTT
+  }
+
+
+  sendRelesData();
+  // Iniciar el servidor web
+  startWebServer();
+}
+
+
+
+
+
+void loop() {
+  server.handleClient();
+
+  // Verificar la conexión WiFi
+  if (WiFi.status() == WL_CONNECTED) {
+    // Si el WiFi está conectado, no debe activarse el modo offline
+    if (offlineMode) {
+      Serial.println("WiFi reconectado, saliendo del modo offline...");
+      offlineMode = false;
+      failedReconnectAttempts = 0;  // Reiniciar el contador de reconexiones fallidas
+      reconnectMQTT();  // Intentar reconectar al broker MQTT
+    }
+
+    // Mantener la conexión MQTT activa
+    if (client.connected()) {
+      client.loop();
+    } else {
+      reconnectMQTT();  // Intentar reconectar a MQTT si no está conectado
+    }
+  } else {
+    // No hay conexión WiFi
+    Serial.println("WiFi desconectado, activando modo offline...");
+    offlineMode = true;
+
+    // Intentar reconectar al WiFi
+    if (connectWifi()) {
+      Serial.println("WiFi reconectado");
+      failedReconnectAttempts = 0;  // Reiniciar contador
+      reconnectMQTT();  // Intentar reconectar a MQTT si WiFi vuelve
+    } else {
+      unsigned long currentMillis = millis();
+      // Ejecutar lógica en modo offline (sin WiFi)
+      //Serial.println("Modo Automatico Activado funcionando sin conexion");
+      //handleOfflineMode(currentMillis);
+    }
+  }
+}
